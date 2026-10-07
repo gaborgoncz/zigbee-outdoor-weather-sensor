@@ -36,6 +36,7 @@
 #include <Preferences.h>
 #include <Wire.h>
 #include "Zigbee.h"
+#include "driver/gpio.h"
 
 /************************ User settings *****************************/
 #define DEBUG_LOG            0     // 1 = print to USB serial (costs battery, bench use only)
@@ -201,6 +202,23 @@ void updateLowBatteryMode() {
   }
 }
 
+/************************ Antenna *****************************/
+// The XIAO ESP32-C6 has an RF switch between the radio and its two antennas:
+//   WIFI_ENABLE (GPIO3)      LOW  = switch powered
+//   WIFI_ANT_CONFIG (GPIO14) HIGH = external U.FL antenna, LOW = on-board antenna
+// The switch is only powered while the radio is in use.
+void antennaOn() {
+  pinMode(WIFI_ANT_CONFIG, OUTPUT);
+  digitalWrite(WIFI_ANT_CONFIG, USE_EXTERNAL_ANTENNA ? HIGH : LOW);
+  digitalWrite(WIFI_ENABLE, LOW);
+}
+
+// Switch off, and hold the pin so it stays off through deep sleep (pins float otherwise)
+void antennaOff() {
+  digitalWrite(WIFI_ENABLE, HIGH);
+  gpio_hold_en((gpio_num_t)WIFI_ENABLE);
+}
+
 /************************ Sleep *****************************/
 // Interval to sleep for right now. Low battery mode can only make it longer, never shorter.
 uint16_t activeIntervalMin() {
@@ -218,6 +236,7 @@ void deepSleepMinutes(uint32_t minutes) {
 #endif
   Wire.end();
   digitalWrite(LED_BUILTIN, HIGH);
+  antennaOff();
   esp_sleep_enable_timer_wakeup((uint64_t)minutes * 60ULL * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -322,6 +341,12 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);  // LED is active low
 
+  // The board package powers the RF switch at boot. Keep it off until the radio is needed,
+  // then release the hold that kept it off during deep sleep.
+  pinMode(WIFI_ENABLE, OUTPUT);
+  digitalWrite(WIFI_ENABLE, HIGH);
+  gpio_hold_dis((gpio_num_t)WIFI_ENABLE);
+
   loadSettings();
 
   // Battery first: an empty cell goes straight back to sleep without powering the radio.
@@ -361,11 +386,6 @@ void setup() {
     }
   }
   LOG("T %.2f C, RH %.1f %%, P %.1f hPa (aht %d, bmp %d)\r\n", temperature, humidity, pressure, climateOk, pressureOk);
-
-  // RF switch: initVariant() already enabled it and selected the on-board antenna
-#if USE_EXTERNAL_ANTENNA
-  digitalWrite(WIFI_ANT_CONFIG, HIGH);
-#endif
 
   // Endpoint 10: temperature, humidity and battery. The manufacturer and model strings are
   // what Zigbee2MQTT uses to pick the external converter.
@@ -422,6 +442,7 @@ void setup() {
   zigbeeConfig.nwk_cfg.zed_cfg.ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_16384MIN;
   zigbeeConfig.nwk_cfg.zed_cfg.keep_alive = 10000;
   Zigbee.setTimeout(joinTimeout);
+  antennaOn();  // sensors are done, the radio starts now
   bool started = Zigbee.begin(&zigbeeConfig, false);
   uint32_t joinStart = millis();
   while (started && !Zigbee.connected() && millis() - joinStart < joinTimeout) {
