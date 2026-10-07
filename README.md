@@ -1,10 +1,12 @@
 # Zigbee outdoor weather sensor
 
+[![Compile](https://github.com/gaborgoncz/zigbee-outdoor-weather-sensor/actions/workflows/compile.yml/badge.svg)](https://github.com/gaborgoncz/zigbee-outdoor-weather-sensor/actions/workflows/compile.yml)
+
 A battery powered outdoor sensor built on the **Seeed Studio XIAO ESP32-C6**. It measures temperature, humidity and air pressure, reports them over **Zigbee** to Home Assistant through Zigbee2MQTT, and spends the rest of its life in deep sleep.
 
 How often it wakes up, and how it behaves on a low battery, is set from Home Assistant with sliders. No reflashing needed.
 
-> **Status:** the firmware compiles for the XIAO ESP32-C6 (arduino-esp32 3.3.11). It has not yet been tested on hardware, and the Zigbee2MQTT converter has not yet been run. Treat this as a first version.
+> **Status:** the firmware compiles for the XIAO ESP32-C6 (arduino-esp32 3.3.11, checked on every push). It has not yet been tested on hardware, and the Zigbee2MQTT converter has not yet been run. Treat this as a first version.
 
 ## Features
 
@@ -110,7 +112,7 @@ The values at the top of [`xiao_c6_outdoor_sensor.ino`](xiao_c6_outdoor_sensor/x
 | `BATTERY_CAL` | `1.0` | Multimeter voltage divided by reported voltage |
 | `BATTERY_CUTOFF_MV` | `3300` | Below this the radio stays off |
 | `ALTITUDE_M` | `0` | Set your altitude to report sea level pressure |
-| `CONFIG_WINDOW_MS` | `1000` | How long to listen for setting changes per wake-up |
+| `CONFIG_WINDOW_MS` | `1000` | Longest wait for Zigbee2MQTT to answer the settings report |
 
 ## How it works
 
@@ -120,7 +122,7 @@ Every wake-up is a fresh boot that runs once and ends in deep sleep:
 2. Read the sensors while the radio is still off.
 3. Start Zigbee and rejoin the network.
 4. Report the measurements and the current settings.
-5. Listen for about a second. If a setting was changed in Home Assistant, Zigbee2MQTT writes it now, and the device stores it in flash.
+5. Wait for Zigbee2MQTT to answer. It writes all three settings back, changed or not, and the device goes on as soon as the third answer is in, normally after a fraction of a second. A changed setting is stored in flash. If no answer comes, it gives up after one second.
 6. Deep sleep for the report interval, or for the low battery interval while the battery is at or below the threshold.
 
 Low battery mode ends once the battery is 5 % above the threshold again. If nothing answers on the network, the sleep time doubles after every failed attempt, up to 16 times the interval.
@@ -140,4 +142,5 @@ Low battery mode ends once the battery is 5 % above the threshold again. If noth
 - **Cold weather:** a Li-ion cell's voltage sags below 0 °C, so the battery percentage dips on cold nights. Lower the threshold if low battery mode kicks in too early.
 - **Charging:** the XIAO charges the cell whenever USB is connected. Li-ion should not be charged below 0 °C.
 - **Calibration:** compare the reported voltage with a multimeter and adjust `BATTERY_CAL`.
+- **Firmware and converter belong together:** the device sleeps as soon as the converter has answered its settings report. With an older converter that only writes changed settings, it still works but waits the full `CONFIG_WINDOW_MS` on every wake-up.
 - **Settings arrive late:** if a setting regularly needs two wake-ups to apply, raise `CONFIG_WINDOW_MS`.

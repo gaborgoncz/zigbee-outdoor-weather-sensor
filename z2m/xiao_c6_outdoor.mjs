@@ -5,6 +5,7 @@
 //   - turns the device's reports into temperature, humidity, pressure, battery and voltage
 //   - exposes three settings as number entities in Home Assistant
 //   - holds a changed setting until the sleeping device wakes up, then writes it
+//   - answers every settings report, so the device can go back to sleep without waiting
 //
 // Install: Zigbee2MQTT UI -> Settings -> Dev console -> External converters -> create
 // "xiao_c6_outdoor.mjs", paste this file, save, restart Zigbee2MQTT.
@@ -21,6 +22,11 @@ const SETTINGS = {
     low_battery_threshold: {endpoint: 13, min: 5, max: 80, step: 1, unit: '%', description: 'Battery level at or below which the low battery interval is used'},
     low_battery_interval: {endpoint: 14, min: 5, max: 720, step: 5, unit: 'min', description: 'Time between two measurements while the battery is low'},
 };
+// A settings report within this time of the previous answer is the device confirming a value
+// it has just applied. It goes to sleep right after, so that one is not answered again.
+const ANSWER_HOLDOFF_MS = 5000;
+const lastAnswer = new Map();
+
 // Reverse lookup: endpoint number -> setting name
 const SETTING_BY_ENDPOINT = Object.fromEntries(Object.entries(SETTINGS).map(([key, s]) => [s.endpoint, key]));
 
@@ -66,28 +72,32 @@ const fzLocal = {
             }
         },
     },
-    // The device reports its settings on every wake-up and then listens for about a second.
-    // If Home Assistant asked for something else in the meantime, write it now.
+    // The device reports its three settings on every wake-up and stays awake until each one
+    // has been answered with a write. The write carries the value Home Assistant wants, which
+    // is usually the value the device already has; then it only means "nothing to change".
     settings: {
         cluster: 'genAnalogOutput',
         type: ['attributeReport', 'readResponse'],
-        convert: async (model, msg, publish, options, meta) => {
+        convert: (model, msg, publish, options, meta) => {
             const key = SETTING_BY_ENDPOINT[msg.endpoint.ID];
             if (!key || msg.data.presentValue === undefined) return;
             const onDevice = Math.round(msg.data.presentValue);
             // Last value set from Home Assistant; undefined until the first report or set
-            const wanted = meta.state?.[key];
-            if (typeof wanted === 'number' && wanted !== onDevice) {
-                try {
-                    await msg.endpoint.write('genAnalogOutput', {presentValue: wanted});
-                } catch {
-                    // Device went back to sleep, the next wake-up tries again
-                }
-                // Publish nothing: the device reports again once it has applied the value
-                return;
+            const wanted = typeof meta.state?.[key] === 'number' ? meta.state[key] : onDevice;
+            const inSync = wanted === onDevice;
+
+            const id = `${msg.device.ieeeAddr}:${key}`;
+            const now = Date.now();
+            if (!inSync || now - (lastAnswer.get(id) ?? 0) > ANSWER_HOLDOFF_MS) {
+                lastAnswer.set(id, now);
+                // Not awaited: a failure only means the device is asleep again, and a setting
+                // that is still different is written again on its next report.
+                msg.endpoint.write('genAnalogOutput', {presentValue: wanted}).catch(() => {});
             }
-            // In sync (or first report): publish what the device uses
-            return {[key]: onDevice};
+
+            // In sync: publish what the device uses. Otherwise publish nothing and keep the
+            // wanted value; the device reports again once it has applied it.
+            if (inSync) return {[key]: onDevice};
         },
     },
 };

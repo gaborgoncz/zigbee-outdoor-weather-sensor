@@ -24,7 +24,8 @@
 //   2. read the sensors while the radio is still off
 //   3. start Zigbee and rejoin the network
 //   4. report the measurements and the current settings
-//   5. listen briefly for settings changed in Home Assistant
+//   5. wait for Zigbee2MQTT to answer the settings report (it writes all three settings back,
+//      changed or not), which normally takes a fraction of a second
 //   6. deep sleep for the report interval (or the low battery interval)
 
 #ifndef ZIGBEE_MODE_ED
@@ -66,7 +67,8 @@
 #define REJOIN_TIMEOUT_MS   8000   // wake from sleep: network is known, rejoin is quick
 #define JOIN_TIMEOUT_MS    60000   // power-on / reset: may need a full join
 #define REPORT_TIMEOUT_MS   1500   // wait for the coordinator to confirm the reports
-#define CONFIG_WINDOW_MS    1000   // stay awake this long for setting changes from HA
+#define CONFIG_WINDOW_MS    1000   // longest wait for Zigbee2MQTT to answer the settings report
+#define ANSWER_GRACE_MS       60   // after the last answer: time for the stack to send its replies
 #define PAIRING_WINDOW_MS 120000   // power-on / reset: stay awake for interview and configure
 #define FACTORY_RESET_HOLD_MS 3000 // hold BOOT during the pairing window to leave the network
 /********************************************************************/
@@ -112,7 +114,7 @@ Settings settings;
 
 // Shared with the Zigbee task (callbacks below run there), hence volatile
 volatile bool settingsChanged = false;        // a setting was written over Zigbee and is not saved yet
-volatile uint32_t lastSettingWriteMs = 0;     // millis() of the last such write
+volatile uint8_t settingsAnswered = 0;        // one bit per setting written by Zigbee2MQTT this wake-up
 volatile uint8_t reportsConfirmed = 0;        // reports acknowledged by the coordinator
 
 // Battery reading of this wake-up
@@ -139,28 +141,42 @@ void saveSettings() {
   prefs.end();
 }
 
-// Called from the Zigbee task when Zigbee2MQTT writes an analog output (and with an unchanged
-// value when the sketch publishes its own setting), so only real changes are flagged.
-void applySetting(uint16_t &target, float value, uint16_t minValue, uint16_t maxValue) {
+// Bits of settingsAnswered
+#define ANSWER_INTERVAL     0x01
+#define ANSWER_LOW_BATT     0x02
+#define ANSWER_LOW_INTERVAL 0x04
+#define ANSWER_ALL          0x07
+
+// The library calls the analog output callbacks in two cases: from the Zigbee task when
+// Zigbee2MQTT writes a value, and from the main task when the sketch publishes its own value.
+// Only the first is an answer from Zigbee2MQTT, so the calling task tells them apart.
+TaskHandle_t mainTask = NULL;
+
+void applySetting(uint8_t answerBit, uint16_t &target, float value, uint16_t minValue, uint16_t maxValue) {
+  if (xTaskGetCurrentTaskHandle() == mainTask) {
+    return;
+  }
   uint16_t v = (uint16_t)constrain(lroundf(value), (long)minValue, (long)maxValue);
   if (v != target) {
     target = v;
     settingsChanged = true;
-    lastSettingWriteMs = millis();
   }
+  // Zigbee2MQTT writes every setting back, also unchanged ones, so this doubles as its
+  // "nothing more to send for this setting" signal.
+  settingsAnswered = settingsAnswered | answerBit;
 }
 
 // One callback per setting: the library passes only the value, not which endpoint it came from
 void onIntervalChange(float value) {
-  applySetting(settings.intervalMin, value, INTERVAL_MIN_MIN, INTERVAL_MAX_MIN);
+  applySetting(ANSWER_INTERVAL, settings.intervalMin, value, INTERVAL_MIN_MIN, INTERVAL_MAX_MIN);
 }
 
 void onLowBattChange(float value) {
-  applySetting(settings.lowBattPercent, value, LOW_BATT_PERCENT_MIN, LOW_BATT_PERCENT_MAX);
+  applySetting(ANSWER_LOW_BATT, settings.lowBattPercent, value, LOW_BATT_PERCENT_MIN, LOW_BATT_PERCENT_MAX);
 }
 
 void onLowIntervalChange(float value) {
-  applySetting(settings.lowBattIntervalMin, value, LOW_BATT_INTERVAL_MIN_MIN, LOW_BATT_INTERVAL_MAX_MIN);
+  applySetting(ANSWER_LOW_INTERVAL, settings.lowBattIntervalMin, value, LOW_BATT_INTERVAL_MIN_MIN, LOW_BATT_INTERVAL_MAX_MIN);
 }
 
 /************************ Battery *****************************/
@@ -269,8 +285,8 @@ void waitForReports(uint8_t expected) {
   LOG("%u/%u reports confirmed\r\n", reportsConfirmed, expected);
 }
 
-// Report the three settings and the interval in effect. Zigbee2MQTT compares the settings
-// with what Home Assistant wants and writes back any that differ. Returns the reports sent.
+// Report the three settings and the interval in effect. Zigbee2MQTT answers each setting by
+// writing back the value Home Assistant wants. Returns the reports sent.
 uint8_t reportSettings() {
   zbInterval.setAnalogOutput(settings.intervalMin);
   zbLowBatt.setAnalogOutput(settings.lowBattPercent);
@@ -331,6 +347,8 @@ void pairingWindow() {
 
 /********************* Arduino functions **************************/
 void setup() {
+  mainTask = xTaskGetCurrentTaskHandle();
+
   // Anything but a timer wake-up is a power-on or a press of the reset button
   bool coldBoot = esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
 
@@ -456,6 +474,7 @@ void setup() {
 
   // Report. A sensor that failed to read is skipped rather than reported with a bogus value.
   reportsConfirmed = 0;
+  settingsAnswered = 0;
   uint8_t sent = 0;
   if (climateOk) {
     zbClimate.setTemperature(temperature);
@@ -480,12 +499,15 @@ void setup() {
     // coordinator only shows up here: nothing was confirmed.
     sleepAfterNetworkFailure();
   } else {
-    // Zigbee2MQTT answers the settings report with any value changed in HA meanwhile.
-    // Every received write keeps the window open a little longer.
+    // Sleep as soon as Zigbee2MQTT has answered all three settings. CONFIG_WINDOW_MS is only
+    // the fallback for a lost answer or a converter that does not answer unchanged settings;
+    // a changed setting missed that way is written again on the next wake-up.
     uint32_t windowStart = millis();
-    while (millis() - windowStart < CONFIG_WINDOW_MS || (settingsChanged && millis() - lastSettingWriteMs < 400)) {
-      delay(20);
+    while (settingsAnswered != ANSWER_ALL && millis() - windowStart < CONFIG_WINDOW_MS) {
+      delay(10);
     }
+    LOG("Settings answered 0x%02x after %lu ms\r\n", settingsAnswered, millis() - windowStart);
+    delay(ANSWER_GRACE_MS);
     commitSettings();
   }
 
