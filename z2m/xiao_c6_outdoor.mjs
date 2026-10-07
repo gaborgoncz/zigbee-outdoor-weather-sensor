@@ -1,6 +1,11 @@
 // Zigbee2MQTT external converter for the XIAO ESP32-C6 outdoor sensor
 // (firmware: ../xiao_c6_outdoor_sensor/xiao_c6_outdoor_sensor.ino)
 //
+// What it does:
+//   - turns the device's reports into temperature, humidity, pressure, battery and voltage
+//   - exposes three settings as number entities in Home Assistant
+//   - holds a changed setting until the sleeping device wakes up, then writes it
+//
 // Install: Zigbee2MQTT UI -> Settings -> Dev console -> External converters -> create
 // "xiao_c6_outdoor.mjs", paste this file, save, restart Zigbee2MQTT.
 
@@ -9,15 +14,19 @@ import * as exposes from 'zigbee-herdsman-converters/lib/exposes';
 const e = exposes.presets;
 const ea = exposes.access;
 
-// Settings live in the analog output cluster of these endpoints
+// Settings live in the analog output cluster of these endpoints.
+// The ranges must match the limits in the firmware.
 const SETTINGS = {
     report_interval: {endpoint: 12, min: 1, max: 240, step: 1, unit: 'min', description: 'Time between two measurements'},
     low_battery_threshold: {endpoint: 13, min: 5, max: 80, step: 1, unit: '%', description: 'Battery level at or below which the low battery interval is used'},
     low_battery_interval: {endpoint: 14, min: 5, max: 720, step: 5, unit: 'min', description: 'Time between two measurements while the battery is low'},
 };
+// Reverse lookup: endpoint number -> setting name
 const SETTING_BY_ENDPOINT = Object.fromEntries(Object.entries(SETTINGS).map(([key, s]) => [s.endpoint, key]));
 
+// Device -> Zigbee2MQTT
 const fzLocal = {
+    // Standard clusters send hundredths of a degree / percent
     temperature: {
         cluster: 'msTemperatureMeasurement',
         type: ['attributeReport', 'readResponse'],
@@ -32,6 +41,7 @@ const fzLocal = {
             if (msg.data.measuredValue !== undefined) return {humidity: msg.data.measuredValue / 100};
         },
     },
+    // Zigbee reports battery in half percent steps
     battery: {
         cluster: 'genPowerCfg',
         type: ['attributeReport', 'readResponse'],
@@ -39,6 +49,7 @@ const fzLocal = {
             if (msg.data.batteryPercentageRemaining !== undefined) return {battery: msg.data.batteryPercentageRemaining / 2};
         },
     },
+    // Float readings, told apart by the endpoint they arrive on
     analog_input: {
         cluster: 'genAnalogInput',
         type: ['attributeReport', 'readResponse'],
@@ -64,6 +75,7 @@ const fzLocal = {
             const key = SETTING_BY_ENDPOINT[msg.endpoint.ID];
             if (!key || msg.data.presentValue === undefined) return;
             const onDevice = Math.round(msg.data.presentValue);
+            // Last value set from Home Assistant; undefined until the first report or set
             const wanted = meta.state?.[key];
             if (typeof wanted === 'number' && wanted !== onDevice) {
                 try {
@@ -71,13 +83,16 @@ const fzLocal = {
                 } catch {
                     // Device went back to sleep, the next wake-up tries again
                 }
+                // Publish nothing: the device reports again once it has applied the value
                 return;
             }
+            // In sync (or first report): publish what the device uses
             return {[key]: onDevice};
         },
     },
 };
 
+// Zigbee2MQTT -> device
 const tzLocal = {
     settings: {
         key: Object.keys(SETTINGS),
@@ -124,6 +139,8 @@ export default {
                 .withCategory('config'),
         ),
     ],
+    // Runs once after pairing: bind every reporting cluster to the coordinator. The firmware
+    // sends its reports to bound targets only, so nothing arrives without these binds.
     configure: async (device, coordinatorEndpoint) => {
         const binds = {
             10: ['msTemperatureMeasurement', 'msRelativeHumidity', 'genPowerCfg'],

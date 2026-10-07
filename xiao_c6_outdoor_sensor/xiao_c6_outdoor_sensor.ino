@@ -18,6 +18,14 @@
 //
 // The three analog outputs are the settings changed from Home Assistant. The device sleeps
 // almost all the time, so Zigbee2MQTT hands a changed setting over on the next wake-up.
+//
+// One wake-up cycle (everything runs in setup(), every wake-up is a fresh boot):
+//   1. read the battery, go straight back to sleep if the cell is empty
+//   2. read the sensors while the radio is still off
+//   3. start Zigbee and rejoin the network
+//   4. report the measurements and the current settings
+//   5. listen briefly for settings changed in Home Assistant
+//   6. deep sleep for the report interval (or the low battery interval)
 
 #ifndef ZIGBEE_MODE_ED
 #error "Zigbee end device mode is not selected in Tools->Zigbee mode"
@@ -62,18 +70,22 @@
 #define FACTORY_RESET_HOLD_MS 3000 // hold BOOT during the pairing window to leave the network
 /********************************************************************/
 
+// Logging compiles to nothing unless DEBUG_LOG is set, so the release build never touches USB serial
 #if DEBUG_LOG
 #define LOG(...) Serial.printf(__VA_ARGS__)
 #else
 #define LOG(...)
 #endif
 
+// Zigbee endpoint numbers, see the table at the top of the file
 #define EP_CLIMATE      10
 #define EP_PRESSURE     11
 #define EP_INTERVAL     12
 #define EP_LOW_BATT     13
 #define EP_LOW_INTERVAL 14
 
+// The library allows one analog input and one analog output per endpoint, which is why the
+// settings and the extra readings are spread over several endpoints.
 ZigbeeTempSensor zbClimate = ZigbeeTempSensor(EP_CLIMATE);
 ZigbeeAnalog zbPressure = ZigbeeAnalog(EP_PRESSURE);
 ZigbeeAnalog zbInterval = ZigbeeAnalog(EP_INTERVAL);
@@ -84,11 +96,12 @@ Adafruit_AHTX0 aht;
 Adafruit_BMP280 bmp;
 Preferences prefs;
 
-// Survive deep sleep, cleared on power-on
-RTC_DATA_ATTR bool lowBatteryMode = false;
-RTC_DATA_ATTR bool pairingDone = false;
-RTC_DATA_ATTR uint8_t networkFailures = 0;
+// Kept in RTC memory: these survive deep sleep and are cleared by power-on or the reset button
+RTC_DATA_ATTR bool lowBatteryMode = false;    // currently using the low battery interval
+RTC_DATA_ATTR bool pairingDone = false;       // the pairing window has been completed since power-on
+RTC_DATA_ATTR uint8_t networkFailures = 0;    // consecutive wake-ups without contact, drives the back-off
 
+// Settings changeable from Home Assistant, stored in flash (NVS) so they survive a battery swap
 struct Settings {
   uint16_t intervalMin;
   uint16_t lowBattPercent;
@@ -96,15 +109,18 @@ struct Settings {
 };
 Settings settings;
 
-volatile bool settingsChanged = false;
-volatile uint32_t lastSettingWriteMs = 0;
-volatile uint8_t reportsConfirmed = 0;
+// Shared with the Zigbee task (callbacks below run there), hence volatile
+volatile bool settingsChanged = false;        // a setting was written over Zigbee and is not saved yet
+volatile uint32_t lastSettingWriteMs = 0;     // millis() of the last such write
+volatile uint8_t reportsConfirmed = 0;        // reports acknowledged by the coordinator
 
+// Battery reading of this wake-up
 uint16_t batteryMv = 0;
 uint8_t batteryPct = 0;
-bool batteryValid = false;
+bool batteryValid = false;                    // false when no cell is on the divider (USB power only)
 
 /************************ Settings *****************************/
+// Read the settings from flash, falling back to the defaults on a fresh device
 void loadSettings() {
   prefs.begin("cfg", true);
   settings.intervalMin = prefs.getUShort("interval", DEFAULT_INTERVAL_MIN);
@@ -113,6 +129,7 @@ void loadSettings() {
   prefs.end();
 }
 
+// Write the settings to flash. Only called after a real change, to spare flash wear.
 void saveSettings() {
   prefs.begin("cfg", false);
   prefs.putUShort("interval", settings.intervalMin);
@@ -132,6 +149,7 @@ void applySetting(uint16_t &target, float value, uint16_t minValue, uint16_t max
   }
 }
 
+// One callback per setting: the library passes only the value, not which endpoint it came from
 void onIntervalChange(float value) {
   applySetting(settings.intervalMin, value, INTERVAL_MIN_MIN, INTERVAL_MAX_MIN);
 }
@@ -145,6 +163,7 @@ void onLowIntervalChange(float value) {
 }
 
 /************************ Battery *****************************/
+// Average of 8 ADC samples, scaled back up by the divider ratio to the real cell voltage
 uint16_t readBatteryMillivolts() {
   uint32_t sum = 0;
   for (int i = 0; i < 8; i++) {
@@ -153,7 +172,8 @@ uint16_t readBatteryMillivolts() {
   return (uint16_t)((sum / 8.0f) * BATTERY_DIVIDER_RATIO * BATTERY_CAL);
 }
 
-// Resting voltage of a single Li-ion / LiPo cell
+// Voltage to charge level for a single Li-ion / LiPo cell at rest: {millivolts, percent}
+// points, linearly interpolated in between.
 uint8_t batteryPercent(uint16_t mv) {
   static const uint16_t curve[][2] = {{4150, 100}, {4050, 90}, {3970, 80}, {3900, 70}, {3840, 60}, {3790, 50},
                                       {3750, 40},  {3710, 30}, {3670, 20}, {3600, 10}, {3450, 5},  {3300, 0}};
@@ -169,6 +189,8 @@ uint8_t batteryPercent(uint16_t mv) {
   return 0;
 }
 
+// Enter low battery mode at the threshold, leave it only LOW_BATT_HYSTERESIS % above it,
+// so a cell hovering around the threshold does not flip back and forth.
 void updateLowBatteryMode() {
   if (!batteryValid) {
     lowBatteryMode = false;
@@ -180,6 +202,7 @@ void updateLowBatteryMode() {
 }
 
 /************************ Sleep *****************************/
+// Interval to sleep for right now. Low battery mode can only make it longer, never shorter.
 uint16_t activeIntervalMin() {
   if (lowBatteryMode) {
     return max(settings.intervalMin, settings.lowBattIntervalMin);
@@ -187,6 +210,7 @@ uint16_t activeIntervalMin() {
   return settings.intervalMin;
 }
 
+// Power everything down and deep sleep. Never returns: the timer wake-up restarts setup().
 void deepSleepMinutes(uint32_t minutes) {
   LOG("Awake for %lu ms, sleeping %lu min\r\n", millis(), minutes);
 #if DEBUG_LOG
@@ -209,12 +233,15 @@ void sleepAfterNetworkFailure() {
 }
 
 /************************ Zigbee *****************************/
+// The coordinator answers every attribute report with a default response. Counting them
+// tells when everything has been delivered, so the device can sleep as early as possible.
 void onGlobalResponse(zb_cmd_type_t command, esp_zb_zcl_status_t status, uint8_t endpoint, uint16_t cluster) {
   if (command == ZB_CMD_REPORT_ATTRIBUTE && status == ESP_ZB_ZCL_STATUS_SUCCESS) {
     reportsConfirmed = reportsConfirmed + 1;
   }
 }
 
+// Block until the expected number of reports is confirmed, or REPORT_TIMEOUT_MS has passed
 void waitForReports(uint8_t expected) {
   uint32_t start = millis();
   while (reportsConfirmed < expected && millis() - start < REPORT_TIMEOUT_MS) {
@@ -223,6 +250,8 @@ void waitForReports(uint8_t expected) {
   LOG("%u/%u reports confirmed\r\n", reportsConfirmed, expected);
 }
 
+// Report the three settings and the interval in effect. Zigbee2MQTT compares the settings
+// with what Home Assistant wants and writes back any that differ. Returns the reports sent.
 uint8_t reportSettings() {
   zbInterval.setAnalogOutput(settings.intervalMin);
   zbLowBatt.setAnalogOutput(settings.lowBattPercent);
@@ -244,7 +273,8 @@ void commitSettings() {
   waitForReports(reportSettings());
 }
 
-// After power-on or reset (or a first join that only succeeded later): stay awake so Zigbee2MQTT can interview and configure the device.
+// After power-on or reset (or a first join that only succeeded later): stay awake so
+// Zigbee2MQTT can interview and configure the device. The LED blinks while the window is open.
 // Holding BOOT leaves the network so the device can be paired again.
 void pairingWindow() {
   LOG("Pairing window open for %d s\r\n", PAIRING_WINDOW_MS / 1000);
@@ -253,6 +283,7 @@ void pairingWindow() {
   uint32_t lastReport = 0;
   while (millis() - start < PAIRING_WINDOW_MS) {
     digitalWrite(LED_BUILTIN, (millis() / 500) % 2);
+    // BOOT held for FACTORY_RESET_HOLD_MS: erase the Zigbee network data and restart
     if (digitalRead(BOOT_PIN) == LOW) {
       uint32_t pressed = millis();
       while (digitalRead(BOOT_PIN) == LOW && millis() - pressed < FACTORY_RESET_HOLD_MS) {
@@ -272,6 +303,7 @@ void pairingWindow() {
       zbInterval.reportAnalogInput();
       reportSettings();
     }
+    // Settings written during the window are applied right away
     commitSettings();
     delay(50);
   }
@@ -280,6 +312,7 @@ void pairingWindow() {
 
 /********************* Arduino functions **************************/
 void setup() {
+  // Anything but a timer wake-up is a power-on or a press of the reset button
   bool coldBoot = esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER;
 
 #if DEBUG_LOG
@@ -297,6 +330,7 @@ void setup() {
   batteryValid = batteryMv > 2500;
   batteryPct = batteryValid ? batteryPercent(batteryMv) : 0;
   LOG("Battery %u mV, %u %%\r\n", batteryMv, batteryPct);
+  // A manual reset skips the cutoff once, so the device can still be reached on a weak cell.
   if (batteryValid && batteryMv < BATTERY_CUTOFF_MV && !coldBoot) {
     deepSleepMinutes(CUTOFF_SLEEP_MIN);
   }
@@ -306,17 +340,20 @@ void setup() {
   Wire.begin();
   bool climateOk = false, pressureOk = false;
   float temperature = 0, humidity = 0, pressure = 0;
+  // AHT20: one measurement takes about 80 ms, the sensor idles by itself afterwards
   if (aht.begin()) {
     sensors_event_t humEvent, tempEvent;
     climateOk = aht.getEvent(&humEvent, &tempEvent);
     temperature = tempEvent.temperature;
     humidity = humEvent.relative_humidity;
   }
+  // BMP280: the I2C address depends on the module, so both are tried
   if (bmp.begin(0x77) || bmp.begin(0x76)) {
     // Forced mode: one conversion, then the BMP280 drops back to its sleep mode
     bmp.setSampling(Adafruit_BMP280::MODE_FORCED, Adafruit_BMP280::SAMPLING_X1, Adafruit_BMP280::SAMPLING_X4, Adafruit_BMP280::FILTER_OFF);
     if (bmp.takeForcedMeasurement()) {
       pressure = bmp.readPressure() / 100.0f;
+      // Barometric formula: convert station pressure to sea level pressure
       if (ALTITUDE_M > 0) {
         pressure = pressure / powf(1.0f - ALTITUDE_M / 44330.0f, 5.255f);
       }
@@ -330,17 +367,20 @@ void setup() {
   digitalWrite(WIFI_ANT_CONFIG, HIGH);
 #endif
 
-  // Endpoints
+  // Endpoint 10: temperature, humidity and battery. The manufacturer and model strings are
+  // what Zigbee2MQTT uses to pick the external converter.
   zbClimate.setManufacturerAndModel("CustomDIY", "XIAO_C6_Outdoor");
   zbClimate.setMinMaxValue(-40, 85);
   zbClimate.setTolerance(0.3);
   zbClimate.addHumiditySensor(0, 100, 2, 0);
   zbClimate.setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPct, batteryMv / 100);
 
+  // Endpoint 11: pressure as a float, for 0.1 hPa resolution
   zbPressure.addAnalogInput();
   zbPressure.setAnalogInputDescription("Pressure (hPa)");
   zbPressure.setAnalogInputResolution(0.1);
 
+  // Endpoint 12: report interval setting, plus the battery voltage reading
   zbInterval.addAnalogOutput();
   zbInterval.setAnalogOutputDescription("Report interval (min)");
   zbInterval.setAnalogOutputResolution(1);
@@ -350,6 +390,7 @@ void setup() {
   zbInterval.setAnalogInputDescription("Battery voltage (V)");
   zbInterval.setAnalogInputResolution(0.001);
 
+  // Endpoint 13: low battery threshold setting, plus the interval currently in effect
   zbLowBatt.addAnalogOutput();
   zbLowBatt.setAnalogOutputDescription("Low battery threshold (%)");
   zbLowBatt.setAnalogOutputResolution(1);
@@ -359,6 +400,7 @@ void setup() {
   zbLowBatt.setAnalogInputDescription("Interval in effect (min)");
   zbLowBatt.setAnalogInputResolution(1);
 
+  // Endpoint 14: low battery interval setting
   zbLowInterval.addAnalogOutput();
   zbLowInterval.setAnalogOutputDescription("Low battery interval (min)");
   zbLowInterval.setAnalogOutputResolution(1);
@@ -385,12 +427,13 @@ void setup() {
   while (started && !Zigbee.connected() && millis() - joinStart < joinTimeout) {
     delay(50);
   }
+  // No network found in time (typically an unpaired device with permit join off)
   if (!started || !Zigbee.connected()) {
     sleepAfterNetworkFailure();
   }
   LOG("Connected after %lu ms\r\n", millis());
 
-  // Report
+  // Report. A sensor that failed to read is skipped rather than reported with a bogus value.
   reportsConfirmed = 0;
   uint8_t sent = 0;
   if (climateOk) {
@@ -429,4 +472,5 @@ void setup() {
   deepSleepMinutes(activeIntervalMin());
 }
 
+// Never reached: setup() always ends in deep sleep
 void loop() {}
