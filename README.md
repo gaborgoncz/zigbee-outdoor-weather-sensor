@@ -1,6 +1,7 @@
 # Zigbee outdoor weather sensor
 
 [![Compile](https://github.com/gaborgoncz/zigbee-outdoor-weather-sensor/actions/workflows/compile.yml/badge.svg)](https://github.com/gaborgoncz/zigbee-outdoor-weather-sensor/actions/workflows/compile.yml)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/gaborgoncz)
 
 A battery powered outdoor sensor built on the **Seeed Studio XIAO ESP32-C6**. It measures temperature, humidity and air pressure, reports them over **Zigbee** to Home Assistant through Zigbee2MQTT, and spends the rest of its life in deep sleep.
 
@@ -144,3 +145,7 @@ Low battery mode ends once the battery is 5 % above the threshold again. If noth
 - **Calibration:** compare the reported voltage with a multimeter and adjust `BATTERY_CAL`.
 - **Firmware and converter belong together:** the device sleeps as soon as the converter has answered its settings report. With an older converter that only writes changed settings, it still works but waits the full `CONFIG_WINDOW_MS` on every wake-up.
 - **Settings arrive late:** if a setting regularly needs two wake-ups to apply, raise `CONFIG_WINDOW_MS`.
+
+## Support
+
+If this project is useful to you, you can [buy me a coffee](https://buymeacoffee.com/gaborgoncz).
